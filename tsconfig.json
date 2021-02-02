@@ -1,0 +1,14 @@
+{
+  "typeAcquisition": {
+    "enable": true,
+  },
+  "compilerOptions": {
+    "allowJs": true,
+    "checkJs": true,
+    "module": "System",
+    "target": "ESNext",
+    "noEmit": true,
+    "outFile": "/dev/null",
+    "moduleResolution": "node"
+  }
+}
