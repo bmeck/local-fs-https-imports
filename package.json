@@ -1,9 +1,9 @@
 {
   "name": "local-fs-https-imports",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "make a local copy of https imports and output a policy file",
   "bin": {
-    "local-fs-https-imports": "./bin/local-fs-https-imports.js"
+    "local-fs-https-imports": "bin/local-fs-https-imports.js"
   },
   "preferGlobal": true,
   "repository": {
