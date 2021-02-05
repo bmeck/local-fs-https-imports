@@ -7,8 +7,36 @@ import path from 'path';
 import fs from 'fs/promises';
 import crypto from 'crypto';
 import url from 'url';
+import { format } from 'util';
 
 let entry = new URL(process.argv[2], url.pathToFileURL(process.cwd() + '/'));
+if (!process.argv[3]) {
+  throw new Error('must supply policy location');
+}
+const policyFile = path.resolve(process.argv[3]);
+const policyDir = path.dirname(policyFile);
+let pendingPathResolutions = [];
+function getAsyncPolicyRelative(filepath) {
+  let jsonPath; 
+  pendingPathResolutions.push({
+    then() {
+      return Promise.resolve(
+        fs.realpath(filepath).then((_) => {
+          return jsonPath = _;
+        })
+      );
+    }
+  });
+  return {
+    toJSON() {
+      if (!jsonPath) throw new Error('still waiting on path resolution for ' + filepath);
+      return `./${path.relative(policyDir, jsonPath)}`
+    }
+  }
+}
+function getPolicyRelative(filepath) {
+  return `./${path.relative(policyDir, filepath)}`;
+}
 async function findNodeModules() {
   let cwd = process.cwd();
   let oldNeedle;
@@ -40,8 +68,13 @@ async function findNodeModules() {
     getFilePathForHREF(href) {
       // YEA YEA YEA, you can get a double extensions, but this allows absolute
       // clarity that the final extension is from this script.
-      return path.join(this.cache, `${encodeURIComponent(href).replaceAll('_', '__').replaceAll('%', '_')}.mjs`);
-    }
+      return path.join(
+        this.cache,
+        `${encodeURIComponent(href)
+          .replaceAll('_', '__')
+          .replaceAll('%', '_')}.mjs`
+      );
+    },
   };
 }
 let outDir = await findNodeModules();
@@ -55,17 +88,17 @@ function isJavaScriptMIME(str) {
 let scope = {
   integrity: true,
   dependencies: {},
-  cascade: true
+  cascade: true,
 };
 let policy = {
   resources: {},
   scopes: {
-    [url.pathToFileURL(outDir.policy).href + '/']: scope
-  }
+    [url.pathToFileURL(outDir.policy).href + '/']: scope,
+  },
 };
 /**
- * 
- * @param {string} body 
+ *
+ * @param {string} body
  * @returns {Set<string>}
  */
 function gatherDeps(body, sourceFilename) {
@@ -106,64 +139,125 @@ function gatherDeps(body, sourceFilename) {
   );
   return gatheredDeps;
 }
+function addHREFToVisit(href) {
+  if (visited.has(href)) return;
+  toVisit.add(href);
+}
 while (toVisit.size) {
   let [next] = toVisit;
   toVisit.delete(next);
   if (visited.has(next)) continue;
   visited.add(next);
-  console.error('visiting', next);
   const nextURL = new URL(next);
   if (nextURL.protocol !== 'https:') {
     if (nextURL.protocol !== 'file:') {
-      throw new Error(`GATHERING FROM ${nextURL.protocol} URLs NOT IMPLEMENTED`);
+      throw new Error(
+        `GATHERING FROM ${nextURL.protocol} URLs NOT IMPLEMENTED`
+      );
     }
     const deps = gatherDeps(await fs.readFile(nextURL, 'utf-8'), next);
     for (const specifier of deps) {
       try {
-        toVisit.add(new URL(specifier).href);
+        const depURL = new URL(specifier);
+        const depHREF = depURL.href;
+        if (depURL.protocol === 'https:') {
+          const depFile = outDir.getFilePathForHREF(depHREF);
+          const key = getPolicyRelative(url.fileURLToPath(next));
+          policy.resources[
+            key
+          ] ??= {
+            "integrity": true,
+            "cascade": true,
+            "dependencies": {}
+          };
+          policy.resources[key].dependencies[specifier] = getAsyncPolicyRelative(depFile);
+        }
+        addHREFToVisit(depHREF);
       } catch (e) {
         if (path.isAbsolute(specifier) || /.?.?[\/\\]/.test(specifier)) {
-          const fileURL = url.pathToFileURL(path.resolve(specifier, url.fileURLToPath(next)));
-          toVisit.add(fileURL.href)
+          const fileURL = url.pathToFileURL(
+            path.resolve(specifier, url.fileURLToPath(next))
+          );
+          addHREFToVisit(fileURL.href);
         }
       }
     }
     continue;
   }
-  let body = await new Promise((f, r) => {
-    https
-      .get(next, (c) => {
-        if (!isJavaScriptMIME(c.headers['content-type'])) {
-          r(new Error('Unknown Content Type: ' + c.headers['content-type']));
-        }
-        let bufs = [];
-        c.on('data', (d) => bufs.push(d));
-        c.on('end', () => {
-          let src = Buffer.concat(bufs).toString('utf-8');
-          f(src);
-        });
-      })
-      .on('abort', () => r(new Error('aborted')))
-      .on('error', (err) => r(err))
-      .on('timeout', () => r(new Error('timeout')));
-  });
-  let integrity = `sha256-${crypto.createHash('sha256').update(body).digest().toString('base64')}`;
+  await fetch(next);
+}
+for (const pending of pendingPathResolutions) {
+  await pending.then();
+}
+await fs.writeFile(policyFile, JSON.stringify(policy, null, 2), 'utf-8');
+
+async function fetch(next) {
   let outFile = outDir.getFilePathForHREF(next);
-  policy.resources[outFile] = {
+  /**
+   * @type {import('http').IncomingMessage}
+   */
+  let res = await new Promise((f, r) => {
+    https.get(next, (res) => f(res)).on('abort', r).on('error', r).on('timeout', r);
+  });
+  if ([301, 302, 303, 307, 308].includes(res.statusCode)) {
+    const redirectLocation = new URL(res.headers['location'], next).href;
+    try {
+      await fs.unlink(outFile);
+    } catch (e) {
+      if (e.code !== 'ENOENT') throw e;
+    }
+    const target = outDir.getFilePathForHREF(redirectLocation);
+    await fs.symlink(target, outFile);
+    scope.dependencies[next] = getAsyncPolicyRelative(target);
+    return fetch(redirectLocation);
+  }
+  let body = await new Promise((f, r) => {
+    let buffers = [];
+    res.on('error', r);
+    res.on('data', (d) => buffers.push(d));
+    res.on('end', () => {
+      let src = Buffer.concat(buffers).toString('utf-8');
+      f(src);
+    });
+  });
+  if (!isJavaScriptMIME(res.headers['content-type'])) {
+    throw new Error(
+      format('%s, Unknown Content Type: %s', next, res.headers['content-type'])
+    );
+  }
+  let integrity = `sha256-${crypto
+    .createHash('sha256')
+    .update(body)
+    .digest()
+    .toString('base64')}`;
+  policy.resources[outFile] ??= {
     integrity,
-    dependencies: {}
+    dependencies: {},
+    cascade: true
   };
-  scope.dependencies[next] = outFile;
+  const resource = policy.resources[outFile];
+  scope.dependencies[next] = getAsyncPolicyRelative(outFile);
   for (const specifier of gatherDeps(body, next)) {
+    let isAbsolute = false;
+    try {
+      new URL(specifier);
+      isAbsolute = true;
+    } catch {}
     const resolved = new URL(specifier, next);
     if (resolved.protocol !== 'https:' && resolved.protocol !== 'data:') {
-      throw new Error('https: modules cannot resolve ' + resolved + ' due to security concerns');
+      throw new Error(
+        'https: modules cannot resolve ' +
+          resolved +
+          ' due to security concerns'
+      );
     }
-    let {href} = resolved;
-    policy.resources[outFile].dependencies[specifier] = outDir.getFilePathForHREF(href);
-    toVisit.add(href)
+    let { href } = resolved;
+    if (true || !isAbsolute) {
+      resource.dependencies[
+        specifier
+      ] = getAsyncPolicyRelative(outDir.getFilePathForHREF(href));
+    }
+    toVisit.add(href);
   }
   await fs.writeFile(outFile, body, 'utf-8');
 }
-console.log(JSON.stringify(policy, null, 2))
-
