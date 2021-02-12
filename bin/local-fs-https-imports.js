@@ -139,7 +139,13 @@ function gatherDeps(body, sourceFilename) {
   );
   return gatheredDeps;
 }
-function addHREFToVisit(href) {
+function addHREFToVisit(href, referrer) {
+  console.log('%j contains ref to %j', referrer, href);
+  let resolved = new URL(href);
+  if (resolved.href !== href) {
+    const target = outDir.getFilePathForHREF(resolved);
+    scope.dependencies[href] = getAsyncPolicyRelative(target);
+  }
   if (visited.has(href)) return;
   toVisit.add(href);
 }
@@ -172,13 +178,13 @@ while (toVisit.size) {
           };
           policy.resources[key].dependencies[specifier] = getAsyncPolicyRelative(depFile);
         }
-        addHREFToVisit(depHREF);
+        addHREFToVisit(depHREF, next);
       } catch (e) {
         if (path.isAbsolute(specifier) || /.?.?[\/\\]/.test(specifier)) {
           const fileURL = url.pathToFileURL(
             path.resolve(specifier, url.fileURLToPath(next))
           );
-          addHREFToVisit(fileURL.href);
+          addHREFToVisit(fileURL.href, next);
         }
       }
     }
@@ -201,6 +207,7 @@ async function fetch(next) {
   });
   if ([301, 302, 303, 307, 308].includes(res.statusCode)) {
     const redirectLocation = new URL(res.headers['location'], next).href;
+    console.log('%j redirected to %j', next, redirectLocation);
     try {
       await fs.unlink(outFile);
     } catch (e) {
@@ -211,6 +218,7 @@ async function fetch(next) {
     scope.dependencies[next] = getAsyncPolicyRelative(target);
     return fetch(redirectLocation);
   }
+  console.log('no redirect %j', next);
   let body = await new Promise((f, r) => {
     let buffers = [];
     res.on('error', r);
@@ -230,12 +238,13 @@ async function fetch(next) {
     .update(body)
     .digest()
     .toString('base64')}`;
-  policy.resources[outFile] ??= {
+  const key = getPolicyRelative(outFile);
+  policy.resources[key] ??= {
     integrity,
     dependencies: {},
     cascade: true
   };
-  const resource = policy.resources[outFile];
+  const resource = policy.resources[key];
   scope.dependencies[next] = getAsyncPolicyRelative(outFile);
   for (const specifier of gatherDeps(body, next)) {
     let isAbsolute = false;
@@ -252,12 +261,18 @@ async function fetch(next) {
       );
     }
     let { href } = resolved;
-    if (true || !isAbsolute) {
+    if (!isAbsolute) {
       resource.dependencies[
         specifier
       ] = getAsyncPolicyRelative(outDir.getFilePathForHREF(href));
     }
-    toVisit.add(href);
+    // some things get messed with, like ' ' => '%20'
+    // TODO: make local entry if munged
+    if (isAbsolute) {
+      addHREFToVisit(specifier, next);
+    } else {
+      addHREFToVisit(href, next);
+    }
   }
   await fs.writeFile(outFile, body, 'utf-8');
 }
