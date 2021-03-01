@@ -3,7 +3,7 @@
 ## Usage
 
 ```mjs
-local-fs-https-imports app.js > policy.json
+local-fs-https-imports app.js policy.json
 node --experimental-policy policy.json app.js
 ```
 
